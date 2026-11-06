@@ -1,47 +1,52 @@
 import { NextRequest, NextResponse } from "next/server";
+import chromium from "@sparticuz/chromium";
+import puppeteer from "puppeteer-core";
 
 export const maxDuration = 60;
 
-const IS_PRODUCTION = process.env.NODE_ENV === "production";
+// Path to locally installed Chrome on Windows for dev mode
+function getLocalChromePath(): string {
+  if (process.env.NODE_ENV === "production") return "";
+
+  const localPaths = [
+    "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe",
+    "C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe",
+    "C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe",
+    "C:\\Program Files\\Microsoft\\Edge\\Application\\msedge.exe",
+  ];
+
+  try {
+    const fs = require("fs");
+    for (const p of localPaths) {
+      if (fs.existsSync(/* turbopackIgnore: true */ p)) return p;
+    }
+  } catch {
+    // ignore
+  }
+  return "";
+}
 
 async function getBrowser() {
-  if (IS_PRODUCTION) {
-    // Production (Vercel): use @sparticuz/chromium + playwright-core
-    const chromium = (await import("@sparticuz/chromium")).default;
-    const { chromium: playwrightChromium } = await import("playwright-core");
-    return playwrightChromium.launch({
-      args: chromium.args,
+  const isProduction = process.env.NODE_ENV === "production";
+
+  if (isProduction) {
+    // Vercel / AWS Lambda environment
+    return puppeteer.launch({
+      args: [...chromium.args, "--hide-scrollbars", "--disable-web-security"],
       executablePath: await chromium.executablePath(),
       headless: true,
     });
   } else {
-    // Local development: use regular playwright with locally installed Chromium
-    const { chromium: playwrightChromium } = await import("playwright-core");
-    // Find the locally installed Chromium from playwright
-    const path = await import("path");
-    const fs = await import("fs");
+    // Local development: use locally installed Chrome / Edge
+    const localPath = getLocalChromePath();
 
-    // Try common playwright browser paths on Windows
-    const userDir = process.env.LOCALAPPDATA || "";
-    const pwDir = path.join(userDir, "ms-playwright");
-    let execPath = "";
-
-    if (fs.existsSync(pwDir)) {
-      const dirs = fs.readdirSync(pwDir).filter(d => d.startsWith("chromium-"));
-      if (dirs.length > 0) {
-        const latestChromium = dirs.sort().pop()!;
-        execPath = path.join(pwDir, latestChromium, "chrome-win64", "chrome.exe");
-      }
+    if (!localPath) {
+      throw new Error("No local Chrome or Edge installation found.");
     }
 
-    if (!execPath || !fs.existsSync(execPath)) {
-      throw new Error(
-        "Chromium not found locally. Run: npx playwright install chromium"
-      );
-    }
-
-    return playwrightChromium.launch({
-      executablePath: execPath,
+    return puppeteer.launch({
+      args: ["--no-sandbox", "--disable-setuid-sandbox"],
+      executablePath: localPath,
       headless: true,
     });
   }
@@ -51,9 +56,8 @@ export async function POST(request: NextRequest) {
   let browser;
   try {
     const body = await request.json();
-    const { html, css, js, filename, pageFormat, landscape, margins } = body;
+    const { html, css, js, filename } = body;
 
-    // Validate required fields
     if (!html) {
       return NextResponse.json(
         { success: false, message: "HTML content is required" },
@@ -61,17 +65,9 @@ export async function POST(request: NextRequest) {
       );
     }
 
-    if (!filename) {
-      return NextResponse.json(
-        { success: false, message: "Filename is required" },
-        { status: 400 }
-      );
-    }
+    const pdfFilename =
+      filename && filename.endsWith(".pdf") ? filename : "document.pdf";
 
-    // Ensure filename ends with .pdf
-    const pdfFilename = filename.endsWith(".pdf") ? filename : `${filename}.pdf`;
-
-    // Build the full HTML document with optional CSS and JS
     const fullHtml = `
 <!DOCTYPE html>
 <html>
@@ -86,17 +82,17 @@ export async function POST(request: NextRequest) {
 </body>
 </html>`;
 
-    // Launch browser (auto-detects local vs production)
     browser = await getBrowser();
     const page = await browser.newPage();
-    await page.setContent(fullHtml, { waitUntil: "networkidle" });
 
-    // Generate PDF as buffer with customizable format, orientation, and margins
+    await page.setContent(fullHtml, {
+      waitUntil: "domcontentloaded",
+    });
+
     const pdfBuffer = await page.pdf({
-      format: (pageFormat as "A4" | "Letter" | "Legal" | "Tabloid") || "A4",
-      landscape: Boolean(landscape),
+      format: "A4",
       printBackground: true,
-      margin: margins || {
+      margin: {
         top: "15mm",
         right: "15mm",
         bottom: "15mm",
@@ -107,36 +103,7 @@ export async function POST(request: NextRequest) {
     await browser.close();
     browser = null;
 
-    // Check if client expects JSON response (e.g. from cURL with Accept header, or format: 'json')
-    const acceptHeader = request.headers.get("accept") || "";
-    const wantsJson = body.format === "json" || acceptHeader.includes("application/json");
-
-    // When running locally, save to the local output folder
-    const OUTPUT_DIR = String.raw`C:\Users\GLT COMPUTER\OneDrive\Desktop\pdftes\pdf\output`;
-    let localFilePath = "";
-
-    try {
-      const fs = await import("fs");
-      const path = await import("path");
-      if (!fs.existsSync(OUTPUT_DIR)) {
-        fs.mkdirSync(OUTPUT_DIR, { recursive: true });
-      }
-      localFilePath = path.join(OUTPUT_DIR, pdfFilename);
-      fs.writeFileSync(localFilePath, pdfBuffer);
-    } catch {
-      // Ephemeral environments like Vercel don't have write access to local folders
-    }
-
-    if (wantsJson) {
-      return NextResponse.json({
-        success: true,
-        message: "PDF generated successfully",
-        filename: pdfFilename,
-        filePath: localFilePath || `/output/${pdfFilename}`,
-      });
-    }
-
-    // Default: Return the PDF as a downloadable file for browsers
+    // Return the PDF buffer as downloadable file
     return new NextResponse(new Uint8Array(pdfBuffer), {
       status: 200,
       headers: {
@@ -148,7 +115,11 @@ export async function POST(request: NextRequest) {
   } catch (error: unknown) {
     console.error("PDF generation error:", error);
     if (browser) {
-      await browser.close();
+      try {
+        await browser.close();
+      } catch {
+        // ignore
+      }
     }
     const errorMessage =
       error instanceof Error ? error.message : "Unknown error occurred";
