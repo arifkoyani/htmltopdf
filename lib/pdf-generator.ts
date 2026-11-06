@@ -7,21 +7,25 @@ export interface GeneratePdfOptions {
 }
 
 /**
- * Navigates to a URL and generates a PDF buffer using Playwright.
+ * Navigates to a URL and generates a PDF buffer using Puppeteer.
  */
 export async function generatePdfFromUrl(
   options: GeneratePdfOptions
-): Promise<Buffer> {
+): Promise<Uint8Array> {
   const { url, format = "A4", landscape = false } = options;
 
   const browser = await getBrowser();
-  const context = await browser.newContext();
-  const page = await context.newPage();
+  let page;
 
   try {
-    // Navigate to the target URL and wait until the network is idle
+    page = await browser.newPage();
+
+    // Set viewport for clean rendering
+    await page.setViewport({ width: 1280, height: 800 });
+
+    // Navigate to the target URL and wait for domcontentloaded
     await page.goto(url, {
-      waitUntil: "networkidle",
+      waitUntil: "domcontentloaded",
       timeout: 30000,
     });
 
@@ -38,10 +42,21 @@ export async function generatePdfFromUrl(
       },
     });
 
-    return pdfBuffer;
+    return new Uint8Array(pdfBuffer);
   } finally {
-    // Always close context/page to free memory
-    await context.close();
+    if (page) {
+      try {
+        await page.close();
+      } catch {
+        // ignore
+      }
+    }
+    if (browser) {
+      try {
+        await browser.close();
+      } catch {
+        // ignore
+      }
+    }
   }
 }
-
